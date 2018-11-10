@@ -2,8 +2,8 @@
 6. Specifying ordering
 
 Specify default ordering for a model using the ``ordering`` attribute, which
-should be a list or tuple of field names. This tells Django how to order the
-results of ``get_list()`` and other similar functions.
+should be a list or tuple of field names. This tells Django how to order
+``QuerySet`` results.
 
 If a field name in ``ordering`` starts with a hyphen, that field will be
 ordered in descending order. Otherwise, it'll be ordered in ascending order.
@@ -16,15 +16,15 @@ undefined -- not random, just undefined.
 from django.db import models
 
 class Article(models.Model):
-    headline = models.CharField(maxlength=100)
+    headline = models.CharField(max_length=100)
     pub_date = models.DateTimeField()
     class Meta:
         ordering = ('-pub_date', 'headline')
 
-    def __str__(self):
+    def __unicode__(self):
         return self.headline
 
-API_TESTS = """
+__test__ = {'API_TESTS':"""
 # Create a couple of Articles.
 >>> from datetime import datetime
 >>> a1 = Article(headline='Article 1', pub_date=datetime(2005, 7, 26))
@@ -48,6 +48,13 @@ API_TESTS = """
 >>> Article.objects.order_by('pub_date', '-headline')
 [<Article: Article 1>, <Article: Article 3>, <Article: Article 2>, <Article: Article 4>]
 
+# Only the last order_by has any effect (since they each override any previous
+# ordering).
+>>> Article.objects.order_by('id')
+[<Article: Article 1>, <Article: Article 2>, <Article: Article 3>, <Article: Article 4>]
+>>> Article.objects.order_by('id').order_by('-headline')
+[<Article: Article 4>, <Article: Article 3>, <Article: Article 2>, <Article: Article 1>]
+
 # Use the 'stop' part of slicing notation to limit the results.
 >>> Article.objects.order_by('headline')[:2]
 [<Article: Article 1>, <Article: Article 2>]
@@ -64,4 +71,19 @@ API_TESTS = """
 # don't know what order the output will be in.
 >>> Article.objects.order_by('?')
 [...]
-"""
+
+# Ordering can be reversed using the reverse() method on a queryset. This
+# allows you to extract things like "the last two items" (reverse and then
+# take the first two).
+>>> Article.objects.all().reverse()[:2]
+[<Article: Article 1>, <Article: Article 3>]
+
+# Ordering can be based on fields included from an 'extra' clause
+>>> Article.objects.extra(select={'foo': 'pub_date'}, order_by=['foo', 'headline'])
+[<Article: Article 1>, <Article: Article 2>, <Article: Article 3>, <Article: Article 4>]
+
+# If the extra clause uses an SQL keyword for a name, it will be protected by quoting.
+>>> Article.objects.extra(select={'order': 'pub_date'}, order_by=['order', 'headline'])
+[<Article: Article 1>, <Article: Article 2>, <Article: Article 3>, <Article: Article 4>]
+
+"""}

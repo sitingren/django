@@ -10,14 +10,14 @@ Set ``related_name`` to designate what the reverse relationship is called.
 from django.db import models
 
 class Person(models.Model):
-    full_name = models.CharField(maxlength=20)
+    full_name = models.CharField(max_length=20)
     mother = models.ForeignKey('self', null=True, related_name='mothers_child_set')
     father = models.ForeignKey('self', null=True, related_name='fathers_child_set')
 
-    def __str__(self):
+    def __unicode__(self):
         return self.full_name
 
-API_TESTS = """
+__test__ = {'API_TESTS':"""
 # Create two Person objects -- the mom and dad in our family.
 >>> dad = Person(full_name='John Smith Senior', mother=None, father=None)
 >>> dad.save()
@@ -40,4 +40,4 @@ API_TESTS = """
 []
 >>> kid.fathers_child_set.all()
 []
-"""
+"""}

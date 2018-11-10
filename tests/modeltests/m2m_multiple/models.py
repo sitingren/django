@@ -1,8 +1,8 @@
 """
 20. Multiple many-to-many relationships between the same two tables
 
-In this example, an Article can have many Categories (as "primary") and many
-Categories (as "secondary").
+In this example, an ``Article`` can have many "primary" ``Category`` objects
+and many "secondary" ``Category`` objects.
 
 Set ``related_name`` to designate what the reverse relationship is called.
 """
@@ -10,25 +10,25 @@ Set ``related_name`` to designate what the reverse relationship is called.
 from django.db import models
 
 class Category(models.Model):
-    name = models.CharField(maxlength=20)
+    name = models.CharField(max_length=20)
     class Meta:
        ordering = ('name',)
 
-    def __str__(self):
+    def __unicode__(self):
         return self.name
 
 class Article(models.Model):
-    headline = models.CharField(maxlength=50)
+    headline = models.CharField(max_length=50)
     pub_date = models.DateTimeField()
     primary_categories = models.ManyToManyField(Category, related_name='primary_article_set')
     secondary_categories = models.ManyToManyField(Category, related_name='secondary_article_set')
     class Meta:
        ordering = ('pub_date',)
 
-    def __str__(self):
+    def __unicode__(self):
         return self.headline
 
-API_TESTS = """
+__test__ = {'API_TESTS':"""
 >>> from datetime import datetime
 
 >>> c1 = Category(name='Sports')
@@ -76,4 +76,4 @@ API_TESTS = """
 []
 >>> c4.secondary_article_set.all()
 [<Article: Area man steals>, <Article: Area man runs>]
-"""
+"""}

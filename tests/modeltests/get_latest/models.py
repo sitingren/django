@@ -2,35 +2,35 @@
 8. get_latest_by
 
 Models can have a ``get_latest_by`` attribute, which should be set to the name
-of a DateField or DateTimeField. If ``get_latest_by`` exists, the model's
-module will get a ``get_latest()`` function, which will return the latest
-object in the database according to that field. "Latest" means "having the
-date farthest into the future."
+of a ``DateField`` or ``DateTimeField``. If ``get_latest_by`` exists, the
+model's manager will get a ``latest()`` method, which will return the latest
+object in the database according to that field. "Latest" means "having the date
+farthest into the future."
 """
 
 from django.db import models
 
 class Article(models.Model):
-    headline = models.CharField(maxlength=100)
+    headline = models.CharField(max_length=100)
     pub_date = models.DateField()
     expire_date = models.DateField()
     class Meta:
         get_latest_by = 'pub_date'
 
-    def __str__(self):
+    def __unicode__(self):
         return self.headline
 
 class Person(models.Model):
-    name = models.CharField(maxlength=30)
+    name = models.CharField(max_length=30)
     birthday = models.DateField()
 
     # Note that this model doesn't have "get_latest_by" set.
 
-    def __str__(self):
+    def __unicode__(self):
         return self.name
 
-API_TESTS = """
-# Because no Articles exist yet, get_latest() raises ArticleDoesNotExist.
+__test__ = {'API_TESTS':"""
+# Because no Articles exist yet, latest() raises ArticleDoesNotExist.
 >>> Article.objects.latest()
 Traceback (most recent call last):
     ...
@@ -76,4 +76,4 @@ AssertionError: latest() requires either a field_name parameter or 'get_latest_b
 
 >>> Person.objects.latest('birthday')
 <Person: Stephanie>
-"""
+"""}

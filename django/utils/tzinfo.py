@@ -2,12 +2,19 @@
 
 import time
 from datetime import timedelta, tzinfo
+from django.utils.encoding import smart_unicode, smart_str, DEFAULT_LOCALE_ENCODING
 
 class FixedOffset(tzinfo):
     "Fixed offset in minutes east from UTC."
     def __init__(self, offset):
-        self.__offset = timedelta(minutes=offset)
-        self.__name = "%+03d%02d" % (offset // 60, offset % 60)
+        if isinstance(offset, timedelta):
+            self.__offset = offset
+            offset = self.__offset.seconds // 60
+        else:
+            self.__offset = timedelta(minutes=offset)
+
+        sign = offset < 0 and '-' or '+'
+        self.__name = u"%s%02d%02d" % (sign, abs(offset) / 60., abs(offset) % 60)
 
     def __repr__(self):
         return self.__name
@@ -24,11 +31,11 @@ class FixedOffset(tzinfo):
 class LocalTimezone(tzinfo):
     "Proxy timezone information from time module."
     def __init__(self, dt):
-        tzinfo.__init__(self, dt)
-        self._tzname = time.tzname[self._isdst(dt)]
+        tzinfo.__init__(self)
+        self._tzname = self.tzname(dt)
 
     def __repr__(self):
-        return self._tzname
+        return smart_str(self._tzname)
 
     def utcoffset(self, dt):
         if self._isdst(dt):
@@ -43,10 +50,28 @@ class LocalTimezone(tzinfo):
             return timedelta(0)
 
     def tzname(self, dt):
-        return time.tzname[self._isdst(dt)]
+        try:
+            return smart_unicode(time.tzname[self._isdst(dt)],
+                                 DEFAULT_LOCALE_ENCODING)
+        except UnicodeDecodeError:
+            return None
 
     def _isdst(self, dt):
         tt = (dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second, dt.weekday(), 0, -1)
-        stamp = time.mktime(tt)
+        try:
+            stamp = time.mktime(tt)
+        except (OverflowError, ValueError):
+            # 32 bit systems can't handle dates after Jan 2038, and certain
+            # systems can't handle dates before ~1901-12-01:
+            #
+            # >>> time.mktime((1900, 1, 13, 0, 0, 0, 0, 0, 0))
+            # OverflowError: mktime argument out of range
+            # >>> time.mktime((1850, 1, 13, 0, 0, 0, 0, 0, 0))
+            # ValueError: year out of range
+            #
+            # In this case, we fake the date, because we only care about the
+            # DST flag.
+            tt = (2037,) + tt[1:]
+            stamp = time.mktime(tt)
         tt = time.localtime(stamp)
         return tt.tm_isdst > 0

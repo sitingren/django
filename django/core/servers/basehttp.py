@@ -8,11 +8,19 @@ been reviewed for security issues. Don't use it for production use.
 """
 
 from BaseHTTPServer import BaseHTTPRequestHandler, HTTPServer
-from types import ListType, StringType
-import os, re, sys, time, urllib
+import mimetypes
+import os
+import re
+import stat
+import sys
+import urllib
+
+from django.core.management.color import color_style
+from django.utils.http import http_date
+from django.utils._os import safe_join
 
 __version__ = "0.1"
-__all__ = ['WSGIServer','WSGIRequestHandler','demo_app']
+__all__ = ['WSGIServer','WSGIRequestHandler']
 
 server_version = "WSGIServer/" + __version__
 sys_version = "Python/" + sys.version.split()[0]
@@ -66,7 +74,7 @@ def _formatparam(param, value=None, quote=1):
 class Headers(object):
     """Manage a collection of HTTP response headers"""
     def __init__(self,headers):
-        if type(headers) is not ListType:
+        if not isinstance(headers, list):
             raise TypeError("Headers must be a list of name/value tuples")
         self._headers = headers
 
@@ -208,15 +216,15 @@ def guess_scheme(environ):
     else:
         return 'http'
 
-_hoppish = {
+_hop_headers = {
     'connection':1, 'keep-alive':1, 'proxy-authenticate':1,
     'proxy-authorization':1, 'te':1, 'trailers':1, 'transfer-encoding':1,
     'upgrade':1
-}.has_key
+}
 
 def is_hop_by_hop(header_name):
     """Return true if 'header_name' is an HTTP/1.1 "Hop-by-Hop" header"""
-    return _hoppish(header_name.lower())
+    return header_name.lower() in _hop_headers
 
 class ServerHandler(object):
     """Manage the invocation of a WSGI application"""
@@ -300,14 +308,15 @@ class ServerHandler(object):
             env.setdefault('SERVER_SOFTWARE',self.server_software)
 
     def finish_response(self):
-        """Send any iterable data, then close self and the iterable
-
-        Subclasses intended for use in asynchronous servers will
-        want to redefine this method, such that it sets up callbacks
-        in the event loop to iterate over the data, and to call
-        'self.close()' once the response is finished.
         """
-        if not self.result_is_file() and not self.sendfile():
+        Send any iterable data, then close self and the iterable
+
+        Subclasses intended for use in asynchronous servers will want to
+        redefine this method, such that it sets up callbacks in the event loop
+        to iterate over the data, and to call 'self.close()' once the response
+        is finished.
+        """
+        if not self.result_is_file() or not self.sendfile():
             for data in self.result:
                 self.write(data)
             self.finish_content()
@@ -321,7 +330,7 @@ class ServerHandler(object):
         """Compute Content-Length or switch to chunked encoding if possible"""
         try:
             blocks = len(self.result)
-        except (TypeError,AttributeError,NotImplementedError):
+        except (TypeError, AttributeError, NotImplementedError):
             pass
         else:
             if blocks==1:
@@ -334,7 +343,7 @@ class ServerHandler(object):
 
         Subclasses can extend this to add other defaults.
         """
-        if not self.headers.has_key('Content-Length'):
+        if 'Content-Length' not in self.headers:
             self.set_content_length()
 
     def start_response(self, status, headers,exc_info=None):
@@ -350,14 +359,14 @@ class ServerHandler(object):
         elif self.headers is not None:
             raise AssertionError("Headers already set!")
 
-        assert type(status) is StringType,"Status must be a string"
+        assert isinstance(status, str),"Status must be a string"
         assert len(status)>=4,"Status must be at least 4 characters"
         assert int(status[:3]),"Status message must begin w/3-digit code"
         assert status[3]==" ", "Status message must have a space after code"
         if __debug__:
             for name,val in headers:
-                assert type(name) is StringType,"Header names must be strings"
-                assert type(val) is StringType,"Header values must be strings"
+                assert isinstance(name, str),"Header names must be strings"
+                assert isinstance(val, str),"Header values must be strings"
                 assert not is_hop_by_hop(name),"Hop-by-hop headers not allowed"
         self.status = status
         self.headers = self.headers_class(headers)
@@ -368,11 +377,11 @@ class ServerHandler(object):
         if self.origin_server:
             if self.client_is_modern():
                 self._write('HTTP/%s %s\r\n' % (self.http_version,self.status))
-                if not self.headers.has_key('Date'):
+                if 'Date' not in self.headers:
                     self._write(
-                        'Date: %s\r\n' % time.asctime(time.gmtime(time.time()))
+                        'Date: %s\r\n' % http_date()
                     )
-                if self.server_software and not self.headers.has_key('Server'):
+                if self.server_software and 'Server' not in self.headers:
                     self._write('Server: %s\r\n' % self.server_software)
         else:
             self._write('Status: %s\r\n' % self.status)
@@ -380,7 +389,7 @@ class ServerHandler(object):
     def write(self, data):
         """'write()' callable as specified by PEP 333"""
 
-        assert type(data) is StringType,"write() argument must be string"
+        assert isinstance(data, str), "write() argument must be string"
 
         if not self.status:
             raise AssertionError("write() before start_response()")
@@ -393,8 +402,20 @@ class ServerHandler(object):
             self.bytes_sent += len(data)
 
         # XXX check Content-Length and truncate if too many bytes written?
-        self._write(data)
-        self._flush()
+
+        # If data is too large, socket will choke, so write chunks no larger
+        # than 32MB at a time.
+        length = len(data)
+        if length > 33554432:
+            offset = 0
+            while offset < length:
+                chunk_size = min(33554432, length)
+                self._write(data[offset:offset+chunk_size])
+                self._flush()
+                offset += chunk_size
+        else:
+            self._write(data)
+            self._flush()
 
     def sendfile(self):
         """Platform-specific file transmission
@@ -509,7 +530,7 @@ class WSGIServer(HTTPServer):
         try:
             HTTPServer.server_bind(self)
         except Exception, e:
-            raise WSGIServerException, e
+            raise WSGIServerException(e)
         self.setup_environ()
 
     def setup_environ(self):
@@ -534,6 +555,10 @@ class WSGIRequestHandler(BaseHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         from django.conf import settings
         self.admin_media_prefix = settings.ADMIN_MEDIA_PREFIX
+        # We set self.path to avoid crashes in log_message() on unsupported
+        # requests (like "OPTIONS").
+        self.path = ''
+        self.style = color_style()
         BaseHTTPRequestHandler.__init__(self, *args, **kwargs)
 
     def get_environ(self):
@@ -585,7 +610,28 @@ class WSGIRequestHandler(BaseHTTPRequestHandler):
         # Don't bother logging requests for admin images or the favicon.
         if self.path.startswith(self.admin_media_prefix) or self.path == '/favicon.ico':
             return
-        sys.stderr.write("[%s] %s\n" % (self.log_date_time_string(), format % args))
+
+        msg = "[%s] %s\n" % (self.log_date_time_string(), format % args)
+
+        # Utilize terminal colors, if available
+        if args[1][0] == '2':
+            # Put 2XX first, since it should be the common case
+            msg = self.style.HTTP_SUCCESS(msg)
+        elif args[1][0] == '1':
+            msg = self.style.HTTP_INFO(msg)
+        elif args[1] == '304':
+            msg = self.style.HTTP_NOT_MODIFIED(msg)
+        elif args[1][0] == '3':
+            msg = self.style.HTTP_REDIRECT(msg)
+        elif args[1] == '404':
+            msg = self.style.HTTP_NOT_FOUND(msg)
+        elif args[1][0] == '4':
+            msg = self.style.HTTP_BAD_REQUEST(msg)
+        else:
+            # Any 5XX, or any other response
+            msg = self.style.HTTP_SERVER_ERROR(msg)
+
+        sys.stderr.write(msg)
 
 class AdminMediaHandler(object):
     """
@@ -594,12 +640,29 @@ class AdminMediaHandler(object):
     Use this ONLY LOCALLY, for development! This hasn't been tested for
     security and is not super efficient.
     """
-    def __init__(self, application):
+    def __init__(self, application, media_dir=None):
         from django.conf import settings
-        import django
         self.application = application
-        self.media_dir = django.__path__[0] + '/contrib/admin/media'
+        if not media_dir:
+            import django
+            self.media_dir = \
+                os.path.join(django.__path__[0], 'contrib', 'admin', 'media')
+        else:
+            self.media_dir = media_dir
         self.media_url = settings.ADMIN_MEDIA_PREFIX
+
+    def file_path(self, url):
+        """
+        Returns the path to the media file on disk for the given URL.
+
+        The passed URL is assumed to begin with ADMIN_MEDIA_PREFIX.  If the
+        resultant file path is outside the media directory, then a ValueError
+        is raised.
+        """
+        # Remove ADMIN_MEDIA_PREFIX.
+        relative_url = url[len(self.media_url):]
+        relative_path = urllib.url2pathname(relative_url)
+        return safe_join(self.media_dir, relative_path)
 
     def __call__(self, environ, start_response):
         import os.path
@@ -611,24 +674,43 @@ class AdminMediaHandler(object):
             return self.application(environ, start_response)
 
         # Find the admin file and serve it up, if it exists and is readable.
-        relative_url = environ['PATH_INFO'][len(self.media_url):]
-        file_path = os.path.join(self.media_dir, relative_url)
+        try:
+            file_path = self.file_path(environ['PATH_INFO'])
+        except ValueError: # Resulting file path was not valid.
+            status = '404 NOT FOUND'
+            headers = {'Content-type': 'text/plain'}
+            output = ['Page not found: %s' % environ['PATH_INFO']]
+            start_response(status, headers.items())
+            return output
         if not os.path.exists(file_path):
             status = '404 NOT FOUND'
             headers = {'Content-type': 'text/plain'}
-            output = ['Page not found: %s' % file_path]
+            output = ['Page not found: %s' % environ['PATH_INFO']]
         else:
             try:
                 fp = open(file_path, 'rb')
             except IOError:
                 status = '401 UNAUTHORIZED'
                 headers = {'Content-type': 'text/plain'}
-                output = ['Permission denied: %s' % file_path]
+                output = ['Permission denied: %s' % environ['PATH_INFO']]
             else:
-                status = '200 OK'
-                headers = {}
-                output = [fp.read()]
-                fp.close()
+                # This is a very simple implementation of conditional GET with
+                # the Last-Modified header. It makes media files a bit speedier
+                # because the files are only read off disk for the first
+                # request (assuming the browser/client supports conditional
+                # GET).
+                mtime = http_date(os.stat(file_path)[stat.ST_MTIME])
+                headers = {'Last-Modified': mtime}
+                if environ.get('HTTP_IF_MODIFIED_SINCE', None) == mtime:
+                    status = '304 NOT MODIFIED'
+                    output = []
+                else:
+                    status = '200 OK'
+                    mime_type = mimetypes.guess_type(file_path)[0]
+                    if mime_type:
+                        headers['Content-Type'] = mime_type
+                    output = [fp.read()]
+                    fp.close()
         start_response(status, headers.items())
         return output
 

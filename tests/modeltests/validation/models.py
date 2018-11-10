@@ -1,149 +1,65 @@
-"""
-30. Validation
-
-This is an experimental feature!
-
-Each model instance has a validate() method that returns a dictionary of
-validation errors in the instance's fields. This method has a side effect
-of converting each field to its appropriate Python data type.
-"""
-
+from datetime import datetime
+from django.core.exceptions import ValidationError
 from django.db import models
+from django.test import TestCase
 
-class Person(models.Model):
-    is_child = models.BooleanField()
-    name = models.CharField(maxlength=20)
-    birthdate = models.DateField()
-    favorite_moment = models.DateTimeField()
-    email = models.EmailField()
 
-    def __str__(self):
-        return self.name
+def validate_answer_to_universe(value):
+    if value != 42:
+        raise ValidationError('This is not the answer to life, universe and everything!', code='not42')
 
-API_TESTS = """
+class ModelToValidate(models.Model):
+    name = models.CharField(max_length=100)
+    created = models.DateTimeField(default=datetime.now)
+    number = models.IntegerField(db_column='number_val')
+    parent = models.ForeignKey('self', blank=True, null=True, limit_choices_to={'number': 10})
+    email = models.EmailField(blank=True)
+    url = models.URLField(blank=True)
+    f_with_custom_validator = models.IntegerField(blank=True, null=True, validators=[validate_answer_to_universe])
 
->>> import datetime
->>> valid_params = {
-...     'is_child': True,
-...     'name': 'John',
-...     'birthdate': datetime.date(2000, 5, 3),
-...     'favorite_moment': datetime.datetime(2002, 4, 3, 13, 23),
-...     'email': 'john@example.com'
-... }
->>> p = Person(**valid_params)
->>> p.validate()
-{}
+    def clean(self):
+        super(ModelToValidate, self).clean()
+        if self.number == 11:
+            raise ValidationError('Invalid number supplied!')
 
->>> p = Person(**dict(valid_params, id='23'))
->>> p.validate()
-{}
->>> p.id
-23
+class UniqueFieldsModel(models.Model):
+    unique_charfield = models.CharField(max_length=100, unique=True)
+    unique_integerfield = models.IntegerField(unique=True)
+    non_unique_field = models.IntegerField()
 
->>> p = Person(**dict(valid_params, id='foo'))
->>> p.validate()
-{'id': ['This value must be an integer.']}
+class CustomPKModel(models.Model):
+    my_pk_field = models.CharField(max_length=100, primary_key=True)
 
->>> p = Person(**dict(valid_params, id=None))
->>> p.validate()
-{}
->>> repr(p.id)
-'None'
+class UniqueTogetherModel(models.Model):
+    cfield = models.CharField(max_length=100)
+    ifield = models.IntegerField()
+    efield = models.EmailField()
 
->>> p = Person(**dict(valid_params, is_child='t'))
->>> p.validate()
-{}
->>> p.is_child
-True
+    class Meta:
+        unique_together = (('ifield', 'cfield',), ['ifield', 'efield'])
 
->>> p = Person(**dict(valid_params, is_child='f'))
->>> p.validate()
-{}
->>> p.is_child
-False
+class UniqueForDateModel(models.Model):
+    start_date = models.DateField()
+    end_date = models.DateTimeField()
+    count = models.IntegerField(unique_for_date="start_date", unique_for_year="end_date")
+    order = models.IntegerField(unique_for_month="end_date")
+    name = models.CharField(max_length=100)
 
->>> p = Person(**dict(valid_params, is_child=True))
->>> p.validate()
-{}
->>> p.is_child
-True
+class CustomMessagesModel(models.Model):
+    other  = models.IntegerField(blank=True, null=True)
+    number = models.IntegerField(db_column='number_val',
+        error_messages={'null': 'NULL', 'not42': 'AAARGH', 'not_equal': '%s != me'},
+        validators=[validate_answer_to_universe]
+    )
 
->>> p = Person(**dict(valid_params, is_child=False))
->>> p.validate()
-{}
->>> p.is_child
-False
+class Author(models.Model):
+    name = models.CharField(max_length=100)
 
->>> p = Person(**dict(valid_params, is_child='foo'))
->>> p.validate()
-{'is_child': ['This value must be either True or False.']}
+class Article(models.Model):
+    title = models.CharField(max_length=100)
+    author = models.ForeignKey(Author)
+    pub_date = models.DateTimeField(blank=True)
 
->>> p = Person(**dict(valid_params, name=u'Jose'))
->>> p.validate()
-{}
->>> p.name
-u'Jose'
-
->>> p = Person(**dict(valid_params, name=227))
->>> p.validate()
-{}
->>> p.name
-'227'
-
->>> p = Person(**dict(valid_params, birthdate=datetime.date(2000, 5, 3)))
->>> p.validate()
-{}
->>> p.birthdate
-datetime.date(2000, 5, 3)
-
->>> p = Person(**dict(valid_params, birthdate=datetime.datetime(2000, 5, 3)))
->>> p.validate()
-{}
->>> p.birthdate
-datetime.date(2000, 5, 3)
-
->>> p = Person(**dict(valid_params, birthdate='2000-05-03'))
->>> p.validate()
-{}
->>> p.birthdate
-datetime.date(2000, 5, 3)
-
->>> p = Person(**dict(valid_params, birthdate='2000-5-3'))
->>> p.validate()
-{}
->>> p.birthdate
-datetime.date(2000, 5, 3)
-
->>> p = Person(**dict(valid_params, birthdate='foo'))
->>> p.validate()
-{'birthdate': ['Enter a valid date in YYYY-MM-DD format.']}
-
->>> p = Person(**dict(valid_params, favorite_moment=datetime.datetime(2002, 4, 3, 13, 23)))
->>> p.validate()
-{}
->>> p.favorite_moment
-datetime.datetime(2002, 4, 3, 13, 23)
-
->>> p = Person(**dict(valid_params, favorite_moment=datetime.datetime(2002, 4, 3)))
->>> p.validate()
-{}
->>> p.favorite_moment
-datetime.datetime(2002, 4, 3, 0, 0)
-
->>> p = Person(**dict(valid_params, email='john@example.com'))
->>> p.validate()
-{}
->>> p.email
-'john@example.com'
-
->>> p = Person(**dict(valid_params, email=u'john@example.com'))
->>> p.validate()
-{}
->>> p.email
-u'john@example.com'
-
->>> p = Person(**dict(valid_params, email=22))
->>> p.validate()
-{'email': ['Enter a valid e-mail address.']}
-
-"""
+    def clean(self):
+        if self.pub_date is None:
+            self.pub_date = datetime.now()

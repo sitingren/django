@@ -1,9 +1,16 @@
-from django.core.handlers.base import BaseHandler
-from django.core import signals
-from django.dispatch import dispatcher
-from django.utils import datastructures
-from django import http
+from threading import Lock
 from pprint import pformat
+try:
+    from cStringIO import StringIO
+except ImportError:
+    from StringIO import StringIO
+
+from django import http
+from django.core import signals
+from django.core.handlers import base
+from django.core.urlresolvers import set_script_prefix
+from django.utils import datastructures
+from django.utils.encoding import force_unicode, iri_to_uri
 
 # See http://www.w3.org/Protocols/rfc2616/rfc2616-sec10.html
 STATUS_CODE_TEXT = {
@@ -50,35 +57,100 @@ STATUS_CODE_TEXT = {
     505: 'HTTP VERSION NOT SUPPORTED',
 }
 
+def safe_copyfileobj(fsrc, fdst, length=16*1024, size=0):
+    """
+    A version of shutil.copyfileobj that will not read more than 'size' bytes.
+    This makes it safe from clients sending more than CONTENT_LENGTH bytes of
+    data in the body.
+    """
+    if not size:
+        return
+    while size > 0:
+        buf = fsrc.read(min(length, size))
+        if not buf:
+            break
+        fdst.write(buf)
+        size -= len(buf)
+
 class WSGIRequest(http.HttpRequest):
     def __init__(self, environ):
+        script_name = base.get_script_name(environ)
+        path_info = force_unicode(environ.get('PATH_INFO', u'/'))
+        if not path_info or path_info == script_name:
+            # Sometimes PATH_INFO exists, but is empty (e.g. accessing
+            # the SCRIPT_NAME URL without a trailing slash). We really need to
+            # operate as if they'd requested '/'. Not amazingly nice to force
+            # the path like this, but should be harmless.
+            #
+            # (The comparison of path_info to script_name is to work around an
+            # apparent bug in flup 1.0.1. Se Django ticket #8490).
+            path_info = u'/'
         self.environ = environ
-        self.path = environ['PATH_INFO']
-        self.META = environ 
+        self.path_info = path_info
+        self.path = '%s%s' % (script_name, path_info)
+        self.META = environ
+        self.META['PATH_INFO'] = path_info
+        self.META['SCRIPT_NAME'] = script_name
         self.method = environ['REQUEST_METHOD'].upper()
+        self._post_parse_error = False
 
     def __repr__(self):
+        # Since this is called as part of error handling, we need to be very
+        # robust against potentially malformed input.
+        try:
+            get = pformat(self.GET)
+        except:
+            get = '<could not parse>'
+        if self._post_parse_error:
+            post = '<could not parse>'
+        else:
+            try:
+                post = pformat(self.POST)
+            except:
+                post = '<could not parse>'
+        try:
+            cookies = pformat(self.COOKIES)
+        except:
+            cookies = '<could not parse>'
+        try:
+            meta = pformat(self.META)
+        except:
+            meta = '<could not parse>'
         return '<WSGIRequest\nGET:%s,\nPOST:%s,\nCOOKIES:%s,\nMETA:%s>' % \
-            (pformat(self.GET), pformat(self.POST), pformat(self.COOKIES),
-            pformat(self.META))
+            (get, post, cookies, meta)
 
     def get_full_path(self):
-        return '%s%s' % (self.path, self.environ.get('QUERY_STRING', '') and ('?' + self.environ.get('QUERY_STRING', '')) or '')
+        # RFC 3986 requires query string arguments to be in the ASCII range.
+        # Rather than crash if this doesn't happen, we encode defensively.
+        return '%s%s' % (self.path, self.environ.get('QUERY_STRING', '') and ('?' + iri_to_uri(self.environ.get('QUERY_STRING', ''))) or '')
 
     def is_secure(self):
-        return self.environ.has_key('HTTPS') and self.environ['HTTPS'] == 'on'
+        return 'wsgi.url_scheme' in self.environ \
+            and self.environ['wsgi.url_scheme'] == 'https'
 
     def _load_post_and_files(self):
         # Populates self._post and self._files
         if self.method == 'POST':
             if self.environ.get('CONTENT_TYPE', '').startswith('multipart'):
-                header_dict = dict([(k, v) for k, v in self.environ.items() if k.startswith('HTTP_')])
-                header_dict['Content-Type'] = self.environ.get('CONTENT_TYPE', '')
-                self._post, self._files = http.parse_file_upload(header_dict, self.raw_post_data)
+                self._raw_post_data = ''
+                try:
+                    self._post, self._files = self.parse_file_upload(self.META, self.environ['wsgi.input'])
+                except:
+                    # An error occured while parsing POST data.  Since when
+                    # formatting the error the request handler might access
+                    # self.POST, set self._post and self._file to prevent
+                    # attempts to parse POST data again.
+                    self._post = http.QueryDict('')
+                    self._files = datastructures.MultiValueDict()
+                    # Mark that an error occured.  This allows self.__repr__ to
+                    # be explicit about it instead of simply representing an
+                    # empty POST
+                    self._post_parse_error = True
+                    raise
             else:
-                self._post, self._files = http.QueryDict(self.raw_post_data), datastructures.MultiValueDict()
+                self._post, self._files = http.QueryDict(self.raw_post_data, encoding=self._encoding), datastructures.MultiValueDict()
         else:
-            self._post, self._files = http.QueryDict(''), datastructures.MultiValueDict()
+            self._post, self._files = http.QueryDict('', encoding=self._encoding), datastructures.MultiValueDict()
 
     def _get_request(self):
         if not hasattr(self, '_request'):
@@ -88,7 +160,7 @@ class WSGIRequest(http.HttpRequest):
     def _get_get(self):
         if not hasattr(self, '_get'):
             # The WSGI spec says 'QUERY_STRING' may be absent.
-            self._get = http.QueryDict(self.environ.get('QUERY_STRING', ''))
+            self._get = http.QueryDict(self.environ.get('QUERY_STRING', ''), encoding=self._encoding)
         return self._get
 
     def _set_get(self, get):
@@ -119,7 +191,20 @@ class WSGIRequest(http.HttpRequest):
         try:
             return self._raw_post_data
         except AttributeError:
-            self._raw_post_data = self.environ['wsgi.input'].read(int(self.environ["CONTENT_LENGTH"]))
+            buf = StringIO()
+            try:
+                # CONTENT_LENGTH might be absent if POST doesn't have content at all (lighttpd)
+                content_length = int(self.environ.get('CONTENT_LENGTH', 0))
+            except (ValueError, TypeError):
+                # If CONTENT_LENGTH was empty string or not an integer, don't
+                # error out. We've also seen None passed in here (against all
+                # specs, but see ticket #8259), so we handle TypeError as well.
+                content_length = 0
+            if content_length > 0:
+                safe_copyfileobj(self.environ['wsgi.input'], buf,
+                        size=content_length)
+            self._raw_post_data = buf.getvalue()
+            buf.close()
             return self._raw_post_data
 
     GET = property(_get_get, _set_get)
@@ -129,38 +214,47 @@ class WSGIRequest(http.HttpRequest):
     REQUEST = property(_get_request)
     raw_post_data = property(_get_raw_post_data)
 
-class WSGIHandler(BaseHandler):
+class WSGIHandler(base.BaseHandler):
+    initLock = Lock()
+    request_class = WSGIRequest
+
     def __call__(self, environ, start_response):
         from django.conf import settings
-
-        if settings.ENABLE_PSYCO:
-            import psyco
-            psyco.profile()
 
         # Set up middleware if needed. We couldn't do this earlier, because
         # settings weren't available.
         if self._request_middleware is None:
-            self.load_middleware()
+            self.initLock.acquire()
+            # Check that middleware is still uninitialised.
+            if self._request_middleware is None:
+                self.load_middleware()
+            self.initLock.release()
 
-        dispatcher.send(signal=signals.request_started)
+        set_script_prefix(base.get_script_name(environ))
+        signals.request_started.send(sender=self.__class__)
         try:
-            request = WSGIRequest(environ)
-            response = self.get_response(request.path, request)
+            try:
+                request = self.request_class(environ)
+            except UnicodeDecodeError:
+                response = http.HttpResponseBadRequest()
+            else:
+                response = self.get_response(request)
 
-            # Apply response middleware
-            for middleware_method in self._response_middleware:
-                response = middleware_method(request, response)
-
+                # Apply response middleware
+                for middleware_method in self._response_middleware:
+                    response = middleware_method(request, response)
+                response = self.apply_response_fixes(request, response)
         finally:
-            dispatcher.send(signal=signals.request_finished)
+            signals.request_finished.send(sender=self.__class__)
 
         try:
             status_text = STATUS_CODE_TEXT[response.status_code]
         except KeyError:
             status_text = 'UNKNOWN STATUS CODE'
         status = '%s %s' % (response.status_code, status_text)
-        response_headers = response.headers.items()
+        response_headers = [(str(k), str(v)) for k, v in response.items()]
         for c in response.cookies.values():
-            response_headers.append(('Set-Cookie', c.output(header='')))
+            response_headers.append(('Set-Cookie', str(c.output(header=''))))
         start_response(status, response_headers)
-        return response.iterator
+        return response
+

@@ -11,9 +11,13 @@ class AdminLogNode(template.Node):
         return "<GetAdminLog Node>"
 
     def render(self, context):
-        if self.user is not None and not self.user.isdigit():
-            self.user = context[self.user].id
-        context[self.varname] = LogEntry.objects.filter(user__id__exact=self.user).select_related()[:self.limit]
+        if self.user is None:
+            context[self.varname] = LogEntry.objects.all().select_related('content_type', 'user')[:self.limit]
+        else:
+            user_id = self.user
+            if not user_id.isdigit():
+                user_id = context[self.user].id
+            context[self.varname] = LogEntry.objects.filter(user__id__exact=user_id).select_related('content_type', 'user')[:self.limit]
         return ''
 
 class DoGetAdminLog:
@@ -40,14 +44,14 @@ class DoGetAdminLog:
     def __call__(self, parser, token):
         tokens = token.contents.split()
         if len(tokens) < 4:
-            raise template.TemplateSyntaxError, "'%s' statements require two arguments" % self.tag_name
+            raise template.TemplateSyntaxError("'%s' statements require two arguments" % self.tag_name)
         if not tokens[1].isdigit():
-            raise template.TemplateSyntaxError, "First argument in '%s' must be an integer" % self.tag_name
+            raise template.TemplateSyntaxError("First argument in '%s' must be an integer" % self.tag_name)
         if tokens[2] != 'as':
-            raise template.TemplateSyntaxError, "Second argument in '%s' must be 'as'" % self.tag_name
+            raise template.TemplateSyntaxError("Second argument in '%s' must be 'as'" % self.tag_name)
         if len(tokens) > 4:
             if tokens[4] != 'for_user':
-                raise template.TemplateSyntaxError, "Fourth argument in '%s' must be 'for_user'" % self.tag_name
+                raise template.TemplateSyntaxError("Fourth argument in '%s' must be 'for_user'" % self.tag_name)
         return AdminLogNode(limit=tokens[1], varname=tokens[3], user=(len(tokens) > 5 and tokens[5] or None))
 
 register.tag('get_admin_log', DoGetAdminLog('get_admin_log'))

@@ -8,15 +8,16 @@ the methods.
 from django.db import models
 
 class Person(models.Model):
-    first_name = models.CharField(maxlength=20)
-    last_name = models.CharField(maxlength=20)
+    first_name = models.CharField(max_length=20)
+    last_name = models.CharField(max_length=20)
 
-    def __str__(self):
-        return "%s %s" % (self.first_name, self.last_name)
+    def __unicode__(self):
+        return u"%s %s" % (self.first_name, self.last_name)
 
-    def save(self):
+    def save(self, force_insert=False, force_update=False):
         print "Before save"
-        super(Person, self).save() # Call the "real" save() method
+         # Call the "real" save() method
+        super(Person, self).save(force_insert, force_update)
         print "After save"
 
     def delete(self):
@@ -24,7 +25,7 @@ class Person(models.Model):
         super(Person, self).delete() # Call the "real" delete() method
         print "After deletion"
 
-API_TESTS = """
+__test__ = {'API_TESTS':"""
 >>> p1 = Person(first_name='John', last_name='Smith')
 >>> p1.save()
 Before save
@@ -39,4 +40,4 @@ After deletion
 
 >>> Person.objects.all()
 []
-"""
+"""}

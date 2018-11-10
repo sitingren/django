@@ -17,23 +17,8 @@ GENDER_CHOICES = (
 )
 
 class Person(models.Model):
-    name = models.CharField(maxlength=20)
-    gender = models.CharField(maxlength=1, choices=GENDER_CHOICES)
+    name = models.CharField(max_length=20)
+    gender = models.CharField(max_length=1, choices=GENDER_CHOICES)
 
-    def __str__(self):
+    def __unicode__(self):
         return self.name
-
-API_TESTS = """
->>> a = Person(name='Adrian', gender='M')
->>> a.save()
->>> s = Person(name='Sara', gender='F')
->>> s.save()
->>> a.gender
-'M'
->>> s.gender
-'F'
->>> a.get_gender_display()
-'Male'
->>> s.get_gender_display()
-'Female'
-"""

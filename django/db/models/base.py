@@ -1,47 +1,87 @@
-import django.db.models.manipulators
-import django.db.models.manager
-from django.core import validators
-from django.core.exceptions import ObjectDoesNotExist
-from django.db.models.fields import AutoField, ImageField, FieldDoesNotExist
-from django.db.models.fields.related import OneToOneRel, ManyToOneRel
-from django.db.models.query import delete_objects
-from django.db.models.options import Options, AdminOptions
-from django.db import connection, backend, transaction
-from django.db.models import signals
-from django.db.models.loading import register_models, get_model
-from django.dispatch import dispatcher
-from django.utils.datastructures import SortedDict
-from django.utils.functional import curry
-from django.conf import settings
 import types
 import sys
 import os
+from itertools import izip
+import django.db.models.manager     # Imported to register signal handler.
+from django.core.exceptions import ObjectDoesNotExist, MultipleObjectsReturned, FieldError, ValidationError, NON_FIELD_ERRORS
+from django.core import validators
+from django.db.models.fields import AutoField, FieldDoesNotExist
+from django.db.models.fields.related import OneToOneRel, ManyToOneRel, OneToOneField
+from django.db.models.query import delete_objects, Q
+from django.db.models.query_utils import CollectedObjects, DeferredAttribute
+from django.db.models.options import Options
+from django.db import connections, router, transaction, DatabaseError, DEFAULT_DB_ALIAS
+from django.db.models import signals
+from django.db.models.loading import register_models, get_model
+from django.utils.translation import ugettext_lazy as _
+import django.utils.copycompat as copy
+from django.utils.functional import curry, update_wrapper
+from django.utils.encoding import smart_str, force_unicode, smart_unicode
+from django.utils.text import get_text_list, capfirst
+from django.conf import settings
 
 class ModelBase(type):
-    "Metaclass for all models"
+    """
+    Metaclass for all models.
+    """
     def __new__(cls, name, bases, attrs):
-        # If this isn't a subclass of Model, don't do anything special.
-        if not bases or bases == (object,):
-            return type.__new__(cls, name, bases, attrs)
+        super_new = super(ModelBase, cls).__new__
+        parents = [b for b in bases if isinstance(b, ModelBase)]
+        if not parents:
+            # If this isn't a subclass of Model, don't do anything special.
+            return super_new(cls, name, bases, attrs)
 
         # Create the class.
-        new_class = type.__new__(cls, name, bases, {'__module__': attrs.pop('__module__')})
-        new_class.add_to_class('_meta', Options(attrs.pop('Meta', None)))
-        new_class.add_to_class('DoesNotExist', types.ClassType('DoesNotExist', (ObjectDoesNotExist,), {}))
+        module = attrs.pop('__module__')
+        new_class = super_new(cls, name, bases, {'__module__': module})
+        attr_meta = attrs.pop('Meta', None)
+        abstract = getattr(attr_meta, 'abstract', False)
+        if not attr_meta:
+            meta = getattr(new_class, 'Meta', None)
+        else:
+            meta = attr_meta
+        base_meta = getattr(new_class, '_meta', None)
 
-        # Build complete list of parents
-        for base in bases:
-            # TODO: Checking for the presence of '_meta' is hackish.
-            if '_meta' in dir(base):
-                new_class._meta.parents.append(base)
-                new_class._meta.parents.extend(base._meta.parents)
-
-        model_module = sys.modules[new_class.__module__]
-
-        if getattr(new_class._meta, 'app_label', None) is None:
+        if getattr(meta, 'app_label', None) is None:
             # Figure out the app_label by looking one level up.
             # For 'django.contrib.sites.models', this would be 'sites'.
-            new_class._meta.app_label = model_module.__name__.split('.')[-2]
+            model_module = sys.modules[new_class.__module__]
+            kwargs = {"app_label": model_module.__name__.split('.')[-2]}
+        else:
+            kwargs = {}
+
+        new_class.add_to_class('_meta', Options(meta, **kwargs))
+        if not abstract:
+            new_class.add_to_class('DoesNotExist', subclass_exception('DoesNotExist',
+                    tuple(x.DoesNotExist
+                            for x in parents if hasattr(x, '_meta') and not x._meta.abstract)
+                                    or (ObjectDoesNotExist,), module))
+            new_class.add_to_class('MultipleObjectsReturned', subclass_exception('MultipleObjectsReturned',
+                    tuple(x.MultipleObjectsReturned
+                            for x in parents if hasattr(x, '_meta') and not x._meta.abstract)
+                                    or (MultipleObjectsReturned,), module))
+            if base_meta and not base_meta.abstract:
+                # Non-abstract child classes inherit some attributes from their
+                # non-abstract parent (unless an ABC comes before it in the
+                # method resolution order).
+                if not hasattr(meta, 'ordering'):
+                    new_class._meta.ordering = base_meta.ordering
+                if not hasattr(meta, 'get_latest_by'):
+                    new_class._meta.get_latest_by = base_meta.get_latest_by
+
+        is_proxy = new_class._meta.proxy
+
+        if getattr(new_class, '_default_manager', None):
+            if not is_proxy:
+                # Multi-table inheritance doesn't inherit default manager from
+                # parents.
+                new_class._default_manager = None
+                new_class._base_manager = None
+            else:
+                # Proxy classes do inherit parent's default manager, if none is
+                # set explicitly.
+                new_class._default_manager = new_class._default_manager._copy_to_model(new_class)
+                new_class._base_manager = new_class._base_manager._copy_to_model(new_class)
 
         # Bail out early if we have already created this class.
         m = get_model(new_class._meta.app_label, name, False)
@@ -52,93 +92,132 @@ class ModelBase(type):
         for obj_name, obj in attrs.items():
             new_class.add_to_class(obj_name, obj)
 
-        # Add Fields inherited from parents
-        for parent in new_class._meta.parents:
-            for field in parent._meta.fields:
-                # Only add parent fields if they aren't defined for this class.
-                try:
-                    new_class._meta.get_field(field.name)
-                except FieldDoesNotExist:
-                    field.contribute_to_class(new_class, field.name)
+        # All the fields of any type declared on this model
+        new_fields = new_class._meta.local_fields + \
+                     new_class._meta.local_many_to_many + \
+                     new_class._meta.virtual_fields
+        field_names = set([f.name for f in new_fields])
+
+        # Basic setup for proxy models.
+        if is_proxy:
+            base = None
+            for parent in [cls for cls in parents if hasattr(cls, '_meta')]:
+                if parent._meta.abstract:
+                    if parent._meta.fields:
+                        raise TypeError("Abstract base class containing model fields not permitted for proxy model '%s'." % name)
+                    else:
+                        continue
+                if base is not None:
+                    raise TypeError("Proxy model '%s' has more than one non-abstract model base class." % name)
+                else:
+                    base = parent
+            if base is None:
+                    raise TypeError("Proxy model '%s' has no non-abstract model base class." % name)
+            if (new_class._meta.local_fields or
+                    new_class._meta.local_many_to_many):
+                raise FieldError("Proxy model '%s' contains model fields." % name)
+            while base._meta.proxy:
+                base = base._meta.proxy_for_model
+            new_class._meta.setup_proxy(base)
+
+        # Do the appropriate setup for any model parents.
+        o2o_map = dict([(f.rel.to, f) for f in new_class._meta.local_fields
+                if isinstance(f, OneToOneField)])
+
+        for base in parents:
+            original_base = base
+            if not hasattr(base, '_meta'):
+                # Things without _meta aren't functional models, so they're
+                # uninteresting parents.
+                continue
+
+            parent_fields = base._meta.local_fields + base._meta.local_many_to_many
+            # Check for clashes between locally declared fields and those
+            # on the base classes (we cannot handle shadowed fields at the
+            # moment).
+            for field in parent_fields:
+                if field.name in field_names:
+                    raise FieldError('Local field %r in class %r clashes '
+                                     'with field of similar name from '
+                                     'base class %r' %
+                                        (field.name, name, base.__name__))
+            if not base._meta.abstract:
+                # Concrete classes...
+                while base._meta.proxy:
+                    # Skip over a proxy class to the "real" base it proxies.
+                    base = base._meta.proxy_for_model
+                if base in o2o_map:
+                    field = o2o_map[base]
+                elif not is_proxy:
+                    attr_name = '%s_ptr' % base._meta.module_name
+                    field = OneToOneField(base, name=attr_name,
+                            auto_created=True, parent_link=True)
+                    new_class.add_to_class(attr_name, field)
+                else:
+                    field = None
+                new_class._meta.parents[base] = field
+            else:
+                # .. and abstract ones.
+                for field in parent_fields:
+                    new_class.add_to_class(field.name, copy.deepcopy(field))
+
+                # Pass any non-abstract parent classes onto child.
+                new_class._meta.parents.update(base._meta.parents)
+
+            # Inherit managers from the abstract base classes.
+            new_class.copy_managers(base._meta.abstract_managers)
+
+            # Proxy models inherit the non-abstract managers from their base,
+            # unless they have redefined any of them.
+            if is_proxy:
+                new_class.copy_managers(original_base._meta.concrete_managers)
+
+            # Inherit virtual fields (like GenericForeignKey) from the parent
+            # class
+            for field in base._meta.virtual_fields:
+                if base._meta.abstract and field.name in field_names:
+                    raise FieldError('Local field %r in class %r clashes '\
+                                     'with field of similar name from '\
+                                     'abstract base class %r' % \
+                                        (field.name, name, base.__name__))
+                new_class.add_to_class(field.name, copy.deepcopy(field))
+
+        if abstract:
+            # Abstract base models can't be instantiated and don't appear in
+            # the list of models for an app. We do the final setup for them a
+            # little differently from normal models.
+            attr_meta.abstract = False
+            new_class.Meta = attr_meta
+            return new_class
 
         new_class._prepare()
-
         register_models(new_class._meta.app_label, new_class)
+
         # Because of the way imports happen (recursively), we may or may not be
-        # the first class for this model to register with the framework. There
-        # should only be one class for each model, so we must always return the
+        # the first time this model tries to register with the framework. There
+        # should only be one class for each model, so we always return the
         # registered version.
         return get_model(new_class._meta.app_label, name, False)
 
-class Model(object):
-    __metaclass__ = ModelBase
-
-    def _get_pk_val(self):
-        return getattr(self, self._meta.pk.attname)
-
-    def __repr__(self):
-        return '<%s: %s>' % (self.__class__.__name__, self)
-
-    def __str__(self):
-        return '%s object' % self.__class__.__name__
-
-    def __eq__(self, other):
-        return isinstance(other, self.__class__) and self._get_pk_val() == other._get_pk_val()
-
-    def __ne__(self, other):
-        return not self.__eq__(other)
-
-    def __init__(self, *args, **kwargs):
-        dispatcher.send(signal=signals.pre_init, sender=self.__class__, args=args, kwargs=kwargs)
-        for f in self._meta.fields:
-            if isinstance(f.rel, ManyToOneRel):
-                try:
-                    # Assume object instance was passed in.
-                    rel_obj = kwargs.pop(f.name)
-                except KeyError:
-                    try:
-                        # Object instance wasn't passed in -- must be an ID.
-                        val = kwargs.pop(f.attname)
-                    except KeyError:
-                        val = f.get_default()
-                else:
-                    # Object instance was passed in.
-                    # Special case: You can pass in "None" for related objects if it's allowed.
-                    if rel_obj is None and f.null:
-                        val = None
-                    else:
-                        try:
-                            val = getattr(rel_obj, f.rel.get_related_field().attname)
-                        except AttributeError:
-                            raise TypeError, "Invalid value: %r should be a %s instance, not a %s" % (f.name, f.rel.to, type(rel_obj))
-                setattr(self, f.attname, val)
-            else:
-                val = kwargs.pop(f.attname, f.get_default())
-                setattr(self, f.attname, val)
-        for prop in kwargs.keys():
-            try:
-                if isinstance(getattr(self.__class__, prop), property):
-                    setattr(self, prop, kwargs.pop(prop))
-            except AttributeError:
-                pass
-        if kwargs:
-            raise TypeError, "'%s' is an invalid keyword argument for this function" % kwargs.keys()[0]
-        for i, arg in enumerate(args):
-            setattr(self, self._meta.fields[i].attname, arg)
-        dispatcher.send(signal=signals.post_init, sender=self.__class__, instance=self)
+    def copy_managers(cls, base_managers):
+        # This is in-place sorting of an Options attribute, but that's fine.
+        base_managers.sort()
+        for _, mgr_name, manager in base_managers:
+            val = getattr(cls, mgr_name, None)
+            if not val or val is manager:
+                new_manager = manager._copy_to_model(cls)
+                cls.add_to_class(mgr_name, new_manager)
 
     def add_to_class(cls, name, value):
-        if name == 'Admin':
-            assert type(value) == types.ClassType, "%r attribute of %s model must be a class, not a %s object" % (name, cls.__name__, type(value))
-            value = AdminOptions(**dict([(k, v) for k, v in value.__dict__.items() if not k.startswith('_')]))
         if hasattr(value, 'contribute_to_class'):
             value.contribute_to_class(cls, name)
         else:
             setattr(cls, name, value)
-    add_to_class = classmethod(add_to_class)
 
     def _prepare(cls):
-        # Creates some methods once self._meta has been populated.
+        """
+        Creates some methods once self._meta has been populated.
+        """
         opts = cls._meta
         opts._prepare(cls)
 
@@ -153,246 +232,680 @@ class Model(object):
             cls.__doc__ = "%s(%s)" % (cls.__name__, ", ".join([f.attname for f in opts.fields]))
 
         if hasattr(cls, 'get_absolute_url'):
-            cls.get_absolute_url = curry(get_absolute_url, opts, cls.get_absolute_url)
+            cls.get_absolute_url = update_wrapper(curry(get_absolute_url, opts, cls.get_absolute_url),
+                                                  cls.get_absolute_url)
 
-        dispatcher.send(signal=signals.class_prepared, sender=cls)
+        signals.class_prepared.send(sender=cls)
 
-    _prepare = classmethod(_prepare)
+class ModelState(object):
+    """
+    A class for storing instance state
+    """
+    def __init__(self, db=None):
+        self.db = db
 
-    def save(self):
-        dispatcher.send(signal=signals.pre_save, sender=self.__class__, instance=self)
+class Model(object):
+    __metaclass__ = ModelBase
+    _deferred = False
 
-        non_pks = [f for f in self._meta.fields if not f.primary_key]
-        cursor = connection.cursor()
+    def __init__(self, *args, **kwargs):
+        signals.pre_init.send(sender=self.__class__, args=args, kwargs=kwargs)
 
-        # First, try an UPDATE. If that doesn't update anything, do an INSERT.
-        pk_val = self._get_pk_val()
-        pk_set = bool(pk_val)
-        record_exists = True
-        if pk_set:
-            # Determine whether a record with the primary key already exists.
-            cursor.execute("SELECT 1 FROM %s WHERE %s=%%s LIMIT 1" % \
-                (backend.quote_name(self._meta.db_table), backend.quote_name(self._meta.pk.column)), [pk_val])
-            # If it does already exist, do an UPDATE.
-            if cursor.fetchone():
-                db_values = [f.get_db_prep_save(f.pre_save(self, False)) for f in non_pks]
-                if db_values:
-                    cursor.execute("UPDATE %s SET %s WHERE %s=%%s" % \
-                        (backend.quote_name(self._meta.db_table),
-                        ','.join(['%s=%%s' % backend.quote_name(f.column) for f in non_pks]),
-                        backend.quote_name(self._meta.pk.column)),
-                        db_values + [pk_val])
+        # Set up the storage for instance state
+        self._state = ModelState()
+
+        # There is a rather weird disparity here; if kwargs, it's set, then args
+        # overrides it. It should be one or the other; don't duplicate the work
+        # The reason for the kwargs check is that standard iterator passes in by
+        # args, and instantiation for iteration is 33% faster.
+        args_len = len(args)
+        if args_len > len(self._meta.fields):
+            # Daft, but matches old exception sans the err msg.
+            raise IndexError("Number of args exceeds number of fields")
+
+        fields_iter = iter(self._meta.fields)
+        if not kwargs:
+            # The ordering of the izip calls matter - izip throws StopIteration
+            # when an iter throws it. So if the first iter throws it, the second
+            # is *not* consumed. We rely on this, so don't change the order
+            # without changing the logic.
+            for val, field in izip(args, fields_iter):
+                setattr(self, field.attname, val)
+        else:
+            # Slower, kwargs-ready version.
+            for val, field in izip(args, fields_iter):
+                setattr(self, field.attname, val)
+                kwargs.pop(field.name, None)
+                # Maintain compatibility with existing calls.
+                if isinstance(field.rel, ManyToOneRel):
+                    kwargs.pop(field.attname, None)
+
+        # Now we're left with the unprocessed fields that *must* come from
+        # keywords, or default.
+
+        for field in fields_iter:
+            is_related_object = False
+            # This slightly odd construct is so that we can access any
+            # data-descriptor object (DeferredAttribute) without triggering its
+            # __get__ method.
+            if (field.attname not in kwargs and
+                    isinstance(self.__class__.__dict__.get(field.attname), DeferredAttribute)):
+                # This field will be populated on request.
+                continue
+            if kwargs:
+                if isinstance(field.rel, ManyToOneRel):
+                    try:
+                        # Assume object instance was passed in.
+                        rel_obj = kwargs.pop(field.name)
+                        is_related_object = True
+                    except KeyError:
+                        try:
+                            # Object instance wasn't passed in -- must be an ID.
+                            val = kwargs.pop(field.attname)
+                        except KeyError:
+                            val = field.get_default()
+                    else:
+                        # Object instance was passed in. Special case: You can
+                        # pass in "None" for related objects if it's allowed.
+                        if rel_obj is None and field.null:
+                            val = None
+                else:
+                    try:
+                        val = kwargs.pop(field.attname)
+                    except KeyError:
+                        # This is done with an exception rather than the
+                        # default argument on pop because we don't want
+                        # get_default() to be evaluated, and then not used.
+                        # Refs #12057.
+                        val = field.get_default()
             else:
-                record_exists = False
-        if not pk_set or not record_exists:
-            field_names = [backend.quote_name(f.column) for f in self._meta.fields if not isinstance(f, AutoField)]
-            db_values = [f.get_db_prep_save(f.pre_save(self, True)) for f in self._meta.fields if not isinstance(f, AutoField)]
-            # If the PK has been manually set, respect that.
-            if pk_set:
-                field_names += [f.column for f in self._meta.fields if isinstance(f, AutoField)]
-                db_values += [f.get_db_prep_save(f.pre_save(self, True)) for f in self._meta.fields if isinstance(f, AutoField)]
-            placeholders = ['%s'] * len(field_names)
-            if self._meta.order_with_respect_to:
-                field_names.append(backend.quote_name('_order'))
-                # TODO: This assumes the database supports subqueries.
-                placeholders.append('(SELECT COUNT(*) FROM %s WHERE %s = %%s)' % \
-                    (backend.quote_name(self._meta.db_table), backend.quote_name(self._meta.order_with_respect_to.column)))
-                db_values.append(getattr(self, self._meta.order_with_respect_to.attname))
-            if db_values:
-                cursor.execute("INSERT INTO %s (%s) VALUES (%s)" % \
-                    (backend.quote_name(self._meta.db_table), ','.join(field_names),
-                    ','.join(placeholders)), db_values)
+                val = field.get_default()
+            if is_related_object:
+                # If we are passed a related instance, set it using the
+                # field.name instead of field.attname (e.g. "user" instead of
+                # "user_id") so that the object gets properly cached (and type
+                # checked) by the RelatedObjectDescriptor.
+                setattr(self, field.name, rel_obj)
             else:
-                # Create a new record with defaults for everything.
-                cursor.execute("INSERT INTO %s (%s) VALUES (%s)" %
-                    (backend.quote_name(self._meta.db_table),
-                     backend.quote_name(self._meta.pk.column),
-                     backend.get_pk_default_value()))
-            if self._meta.has_auto_field and not pk_set:
-                setattr(self, self._meta.pk.attname, backend.get_last_insert_id(cursor, self._meta.db_table, self._meta.pk.column))
-        transaction.commit_unless_managed()
+                setattr(self, field.attname, val)
 
-        # Run any post-save hooks.
-        dispatcher.send(signal=signals.post_save, sender=self.__class__, instance=self)
+        if kwargs:
+            for prop in kwargs.keys():
+                try:
+                    if isinstance(getattr(self.__class__, prop), property):
+                        setattr(self, prop, kwargs.pop(prop))
+                except AttributeError:
+                    pass
+            if kwargs:
+                raise TypeError("'%s' is an invalid keyword argument for this function" % kwargs.keys()[0])
+        signals.post_init.send(sender=self.__class__, instance=self)
+
+    def __repr__(self):
+        try:
+            u = unicode(self)
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            u = '[Bad Unicode data]'
+        return smart_str(u'<%s: %s>' % (self.__class__.__name__, u))
+
+    def __str__(self):
+        if hasattr(self, '__unicode__'):
+            return force_unicode(self).encode('utf-8')
+        return '%s object' % self.__class__.__name__
+
+    def __eq__(self, other):
+        return isinstance(other, self.__class__) and self._get_pk_val() == other._get_pk_val()
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+    def __hash__(self):
+        return hash(self._get_pk_val())
+
+    def __reduce__(self):
+        """
+        Provide pickling support. Normally, this just dispatches to Python's
+        standard handling. However, for models with deferred field loading, we
+        need to do things manually, as they're dynamically created classes and
+        only module-level classes can be pickled by the default path.
+        """
+        data = self.__dict__
+        model = self.__class__
+        # The obvious thing to do here is to invoke super().__reduce__()
+        # for the non-deferred case. Don't do that.
+        # On Python 2.4, there is something wierd with __reduce__,
+        # and as a result, the super call will cause an infinite recursion.
+        # See #10547 and #12121.
+        defers = []
+        pk_val = None
+        if self._deferred:
+            from django.db.models.query_utils import deferred_class_factory
+            factory = deferred_class_factory
+            for field in self._meta.fields:
+                if isinstance(self.__class__.__dict__.get(field.attname),
+                        DeferredAttribute):
+                    defers.append(field.attname)
+                    if pk_val is None:
+                        # The pk_val and model values are the same for all
+                        # DeferredAttribute classes, so we only need to do this
+                        # once.
+                        obj = self.__class__.__dict__[field.attname]
+                        model = obj.model_ref()
+        else:
+            factory = simple_class_factory
+        return (model_unpickle, (model, defers, factory), data)
+
+    def _get_pk_val(self, meta=None):
+        if not meta:
+            meta = self._meta
+        return getattr(self, meta.pk.attname)
+
+    def _set_pk_val(self, value):
+        return setattr(self, self._meta.pk.attname, value)
+
+    pk = property(_get_pk_val, _set_pk_val)
+
+    def serializable_value(self, field_name):
+        """
+        Returns the value of the field name for this instance. If the field is
+        a foreign key, returns the id value, instead of the object. If there's
+        no Field object with this name on the model, the model attribute's
+        value is returned directly.
+
+        Used to serialize a field's value (in the serializer, or form output,
+        for example). Normally, you would just access the attribute directly
+        and not use this method.
+        """
+        try:
+            field = self._meta.get_field_by_name(field_name)[0]
+        except FieldDoesNotExist:
+            return getattr(self, field_name)
+        return getattr(self, field.attname)
+
+    def save(self, force_insert=False, force_update=False, using=None):
+        """
+        Saves the current instance. Override this in a subclass if you want to
+        control the saving process.
+
+        The 'force_insert' and 'force_update' parameters can be used to insist
+        that the "save" must be an SQL insert or update (or equivalent for
+        non-SQL backends), respectively. Normally, they should not be set.
+        """
+        if force_insert and force_update:
+            raise ValueError("Cannot force both insert and updating in model saving.")
+        self.save_base(using=using, force_insert=force_insert, force_update=force_update)
 
     save.alters_data = True
 
-    def validate(self):
+    def save_base(self, raw=False, cls=None, origin=None, force_insert=False,
+            force_update=False, using=None):
         """
-        First coerces all fields on this instance to their proper Python types.
-        Then runs validation on every field. Returns a dictionary of
-        field_name -> error_list.
+        Does the heavy-lifting involved in saving. Subclasses shouldn't need to
+        override this method. It's separate from save() in order to hide the
+        need for overrides of save() to pass around internal-only parameters
+        ('raw', 'cls', and 'origin').
         """
-        error_dict = {}
-        invalid_python = {}
-        for f in self._meta.fields:
-            try:
-                setattr(self, f.attname, f.to_python(getattr(self, f.attname, f.get_default())))
-            except validators.ValidationError, e:
-                error_dict[f.name] = e.messages
-                invalid_python[f.name] = 1
-        for f in self._meta.fields:
-            if f.name in invalid_python:
-                continue
-            errors = f.validate_full(getattr(self, f.attname, f.get_default()), self.__dict__)
-            if errors:
-                error_dict[f.name] = errors
-        return error_dict
+        using = using or router.db_for_write(self.__class__, instance=self)
+        connection = connections[using]
+        assert not (force_insert and force_update)
+        if cls is None:
+            cls = self.__class__
+            meta = cls._meta
+            if not meta.proxy:
+                origin = cls
+        else:
+            meta = cls._meta
 
-    def _collect_sub_objects(self, seen_objs):
+        if origin and not meta.auto_created:
+            signals.pre_save.send(sender=origin, instance=self, raw=raw, using=using)
+
+        # If we are in a raw save, save the object exactly as presented.
+        # That means that we don't try to be smart about saving attributes
+        # that might have come from the parent class - we just save the
+        # attributes we have been given to the class we have been given.
+        # We also go through this process to defer the save of proxy objects
+        # to their actual underlying model.
+        if not raw or meta.proxy:
+            if meta.proxy:
+                org = cls
+            else:
+                org = None
+            for parent, field in meta.parents.items():
+                # At this point, parent's primary key field may be unknown
+                # (for example, from administration form which doesn't fill
+                # this field). If so, fill it.
+                if field and getattr(self, parent._meta.pk.attname) is None and getattr(self, field.attname) is not None:
+                    setattr(self, parent._meta.pk.attname, getattr(self, field.attname))
+
+                self.save_base(cls=parent, origin=org, using=using)
+
+                if field:
+                    setattr(self, field.attname, self._get_pk_val(parent._meta))
+            if meta.proxy:
+                return
+
+        if not meta.proxy:
+            non_pks = [f for f in meta.local_fields if not f.primary_key]
+
+            # First, try an UPDATE. If that doesn't update anything, do an INSERT.
+            pk_val = self._get_pk_val(meta)
+            pk_set = pk_val is not None
+            record_exists = True
+            manager = cls._base_manager
+            if pk_set:
+                # Determine whether a record with the primary key already exists.
+                if (force_update or (not force_insert and
+                        manager.using(using).filter(pk=pk_val).exists())):
+                    # It does already exist, so do an UPDATE.
+                    if force_update or non_pks:
+                        values = [(f, None, (raw and getattr(self, f.attname) or f.pre_save(self, False))) for f in non_pks]
+                        rows = manager.using(using).filter(pk=pk_val)._update(values)
+                        if force_update and not rows:
+                            raise DatabaseError("Forced update did not affect any rows.")
+                else:
+                    record_exists = False
+            if not pk_set or not record_exists:
+                if meta.order_with_respect_to:
+                    # If this is a model with an order_with_respect_to
+                    # autopopulate the _order field
+                    field = meta.order_with_respect_to
+                    order_value = manager.using(using).filter(**{field.name: getattr(self, field.attname)}).count()
+                    setattr(self, '_order', order_value)
+
+                if not pk_set:
+                    if force_update:
+                        raise ValueError("Cannot force an update in save() with no primary key.")
+                    values = [(f, f.get_db_prep_save(raw and getattr(self, f.attname) or f.pre_save(self, True), connection=connection))
+                        for f in meta.local_fields if not isinstance(f, AutoField)]
+                else:
+                    values = [(f, f.get_db_prep_save(raw and getattr(self, f.attname) or f.pre_save(self, True), connection=connection))
+                        for f in meta.local_fields]
+
+                record_exists = False
+
+                update_pk = bool(meta.has_auto_field and not pk_set)
+                if values:
+                    # Create a new record.
+                    result = manager._insert(values, return_id=update_pk, using=using)
+                else:
+                    # Create a new record with defaults for everything.
+                    result = manager._insert([(meta.pk, connection.ops.pk_default_value())], return_id=update_pk, raw_values=True, using=using)
+
+                if update_pk:
+                    setattr(self, meta.pk.attname, result)
+            transaction.commit_unless_managed(using=using)
+
+        # Store the database on which the object was saved
+        self._state.db = using
+
+        # Signal that the save is complete
+        if origin and not meta.auto_created:
+            signals.post_save.send(sender=origin, instance=self,
+                created=(not record_exists), raw=raw, using=using)
+
+    save_base.alters_data = True
+
+    def _collect_sub_objects(self, seen_objs, parent=None, nullable=False):
         """
-        Recursively populates seen_objs with all objects related to this object.
-        When done, seen_objs will be in the format:
-            {model_class: {pk_val: obj, pk_val: obj, ...},
-             model_class: {pk_val: obj, pk_val: obj, ...}, ...}
+        Recursively populates seen_objs with all objects related to this
+        object.
+
+        When done, seen_objs.items() will be in the format:
+            [(model_class, {pk_val: obj, pk_val: obj, ...}),
+             (model_class, {pk_val: obj, pk_val: obj, ...}), ...]
         """
         pk_val = self._get_pk_val()
-        if pk_val in seen_objs.setdefault(self.__class__, {}):
+        if seen_objs.add(self.__class__, pk_val, self,
+                         type(parent), parent, nullable):
             return
-        seen_objs.setdefault(self.__class__, {})[pk_val] = self
 
         for related in self._meta.get_all_related_objects():
             rel_opts_name = related.get_accessor_name()
-            if isinstance(related.field.rel, OneToOneRel):
+            if not related.field.rel.multiple:
                 try:
                     sub_obj = getattr(self, rel_opts_name)
                 except ObjectDoesNotExist:
                     pass
                 else:
-                    sub_obj._collect_sub_objects(seen_objs)
+                    sub_obj._collect_sub_objects(seen_objs, self, related.field.null)
             else:
-                for sub_obj in getattr(self, rel_opts_name).all():
-                    sub_obj._collect_sub_objects(seen_objs)
+                # To make sure we can access all elements, we can't use the
+                # normal manager on the related object. So we work directly
+                # with the descriptor object.
+                for cls in self.__class__.mro():
+                    if rel_opts_name in cls.__dict__:
+                        rel_descriptor = cls.__dict__[rel_opts_name]
+                        break
+                else:
+                    # in the case of a hidden fkey just skip it, it'll get
+                    # processed as an m2m
+                    if not related.field.rel.is_hidden():
+                        raise AssertionError("Should never get here.")
+                    else:
+                        continue
+                delete_qs = rel_descriptor.delete_manager(self).all()
+                for sub_obj in delete_qs:
+                    sub_obj._collect_sub_objects(seen_objs, self, related.field.null)
 
-    def delete(self):
+        for related in self._meta.get_all_related_many_to_many_objects():
+            if related.field.rel.through:
+                db = router.db_for_write(related.field.rel.through.__class__, instance=self)
+                opts = related.field.rel.through._meta
+                reverse_field_name = related.field.m2m_reverse_field_name()
+                nullable = opts.get_field(reverse_field_name).null
+                filters = {reverse_field_name: self}
+                for sub_obj in related.field.rel.through._base_manager.using(db).filter(**filters):
+                    sub_obj._collect_sub_objects(seen_objs, self, nullable)
+
+        for f in self._meta.many_to_many:
+            if f.rel.through:
+                db = router.db_for_write(f.rel.through.__class__, instance=self)
+                opts = f.rel.through._meta
+                field_name = f.m2m_field_name()
+                nullable = opts.get_field(field_name).null
+                filters = {field_name: self}
+                for sub_obj in f.rel.through._base_manager.using(db).filter(**filters):
+                    sub_obj._collect_sub_objects(seen_objs, self, nullable)
+            else:
+                # m2m-ish but with no through table? GenericRelation: cascade delete
+                for sub_obj in f.value_from_object(self).all():
+                    # Generic relations not enforced by db constraints, thus we can set
+                    # nullable=True, order does not matter
+                    sub_obj._collect_sub_objects(seen_objs, self, True)
+
+        # Handle any ancestors (for the model-inheritance case). We do this by
+        # traversing to the most remote parent classes -- those with no parents
+        # themselves -- and then adding those instances to the collection. That
+        # will include all the child instances down to "self".
+        parent_stack = [p for p in self._meta.parents.values() if p is not None]
+        while parent_stack:
+            link = parent_stack.pop()
+            parent_obj = getattr(self, link.name)
+            if parent_obj._meta.parents:
+                parent_stack.extend(parent_obj._meta.parents.values())
+                continue
+            # At this point, parent_obj is base class (no ancestor models). So
+            # delete it and all its descendents.
+            parent_obj._collect_sub_objects(seen_objs)
+
+    def delete(self, using=None):
+        using = using or router.db_for_write(self.__class__, instance=self)
         assert self._get_pk_val() is not None, "%s object can't be deleted because its %s attribute is set to None." % (self._meta.object_name, self._meta.pk.attname)
 
-        # Find all the objects than need to be deleted
-        seen_objs = SortedDict()
+        # Find all the objects than need to be deleted.
+        seen_objs = CollectedObjects()
         self._collect_sub_objects(seen_objs)
 
-        # Actually delete the objects
-        delete_objects(seen_objs)
+        # Actually delete the objects.
+        delete_objects(seen_objs, using)
 
     delete.alters_data = True
 
     def _get_FIELD_display(self, field):
         value = getattr(self, field.attname)
-        return dict(field.choices).get(value, value)
+        return force_unicode(dict(field.flatchoices).get(value, value), strings_only=True)
 
     def _get_next_or_previous_by_FIELD(self, field, is_next, **kwargs):
-        op = is_next and '>' or '<'
-        where = '(%s %s %%s OR (%s = %%s AND %s.%s %s %%s))' % \
-            (backend.quote_name(field.column), op, backend.quote_name(field.column),
-            backend.quote_name(self._meta.db_table), backend.quote_name(self._meta.pk.column), op)
-        param = str(getattr(self, field.attname))
-        q = self.__class__._default_manager.filter(**kwargs).order_by((not is_next and '-' or '') + field.name, (not is_next and '-' or '') + self._meta.pk.name)
-        q._where.append(where)
-        q._params.extend([param, param, getattr(self, self._meta.pk.attname)])
+        op = is_next and 'gt' or 'lt'
+        order = not is_next and '-' or ''
+        param = smart_str(getattr(self, field.attname))
+        q = Q(**{'%s__%s' % (field.name, op): param})
+        q = q|Q(**{field.name: param, 'pk__%s' % op: self.pk})
+        qs = self.__class__._default_manager.using(self._state.db).filter(**kwargs).filter(q).order_by('%s%s' % (order, field.name), '%spk' % order)
         try:
-            return q[0]
+            return qs[0]
         except IndexError:
-            raise self.DoesNotExist, "%s matching query does not exist." % self.__class__._meta.object_name
+            raise self.DoesNotExist("%s matching query does not exist." % self.__class__._meta.object_name)
 
     def _get_next_or_previous_in_order(self, is_next):
         cachename = "__%s_order_cache" % is_next
         if not hasattr(self, cachename):
-            op = is_next and '>' or '<'
+            op = is_next and 'gt' or 'lt'
+            order = not is_next and '-_order' or '_order'
             order_field = self._meta.order_with_respect_to
-            where = ['%s %s (SELECT %s FROM %s WHERE %s=%%s)' % \
-                (backend.quote_name('_order'), op, backend.quote_name('_order'),
-                backend.quote_name(self._meta.db_table), backend.quote_name(self._meta.pk.column)),
-                '%s=%%s' % backend.quote_name(order_field.column)]
-            params = [self._get_pk_val(), getattr(self, order_field.attname)]
-            obj = self._default_manager.order_by('_order').extra(where=where, params=params)[:1].get()
+            obj = self._default_manager.filter(**{
+                order_field.name: getattr(self, order_field.attname)
+            }).filter(**{
+                '_order__%s' % op: self._default_manager.values('_order').filter(**{
+                    self._meta.pk.name: self.pk
+                })
+            }).order_by(order)[:1].get()
             setattr(self, cachename, obj)
         return getattr(self, cachename)
 
-    def _get_FIELD_filename(self, field):
-        if getattr(self, field.attname): # value is not blank
-            return os.path.join(settings.MEDIA_ROOT, getattr(self, field.attname))
-        return ''
+    def prepare_database_save(self, unused):
+        return self.pk
 
-    def _get_FIELD_url(self, field):
-        if getattr(self, field.attname): # value is not blank
-            import urlparse
-            return urlparse.urljoin(settings.MEDIA_URL, getattr(self, field.attname)).replace('\\', '/')
-        return ''
+    def clean(self):
+        """
+        Hook for doing any extra model-wide validation after clean() has been
+        called on every field by self.clean_fields. Any ValidationError raised
+        by this method will not be associated with a particular field; it will
+        have a special-case association with the field defined by NON_FIELD_ERRORS.
+        """
+        pass
 
-    def _get_FIELD_size(self, field):
-        return os.path.getsize(self._get_FIELD_filename(field))
+    def validate_unique(self, exclude=None):
+        """
+        Checks unique constraints on the model and raises ``ValidationError``
+        if any failed.
+        """
+        unique_checks, date_checks = self._get_unique_checks(exclude=exclude)
 
-    def _save_FIELD_file(self, field, filename, raw_contents):
-        directory = field.get_directory_name()
-        try: # Create the date-based directory if it doesn't exist.
-            os.makedirs(os.path.join(settings.MEDIA_ROOT, directory))
-        except OSError: # Directory probably already exists.
-            pass
-        filename = field.get_filename(filename)
+        errors = self._perform_unique_checks(unique_checks)
+        date_errors = self._perform_date_checks(date_checks)
 
-        # If the filename already exists, keep adding an underscore to the name of
-        # the file until the filename doesn't exist.
-        while os.path.exists(os.path.join(settings.MEDIA_ROOT, filename)):
-            try:
-                dot_index = filename.rindex('.')
-            except ValueError: # filename has no dot
-                filename += '_'
+        for k, v in date_errors.items():
+            errors.setdefault(k, []).extend(v)
+
+        if errors:
+            raise ValidationError(errors)
+
+    def _get_unique_checks(self, exclude=None):
+        """
+        Gather a list of checks to perform. Since validate_unique could be
+        called from a ModelForm, some fields may have been excluded; we can't
+        perform a unique check on a model that is missing fields involved
+        in that check.
+        Fields that did not validate should also be exluded, but they need
+        to be passed in via the exclude argument.
+        """
+        if exclude is None:
+            exclude = []
+        unique_checks = []
+
+        unique_togethers = [(self.__class__, self._meta.unique_together)]
+        for parent_class in self._meta.parents.keys():
+            if parent_class._meta.unique_together:
+                unique_togethers.append((parent_class, parent_class._meta.unique_together))
+
+        for model_class, unique_together in unique_togethers:
+            for check in unique_together:
+                for name in check:
+                    # If this is an excluded field, don't add this check.
+                    if name in exclude:
+                        break
+                else:
+                    unique_checks.append((model_class, tuple(check)))
+
+        # These are checks for the unique_for_<date/year/month>.
+        date_checks = []
+
+        # Gather a list of checks for fields declared as unique and add them to
+        # the list of checks.
+
+        fields_with_class = [(self.__class__, self._meta.local_fields)]
+        for parent_class in self._meta.parents.keys():
+            fields_with_class.append((parent_class, parent_class._meta.local_fields))
+
+        for model_class, fields in fields_with_class:
+            for f in fields:
+                name = f.name
+                if name in exclude:
+                    continue
+                if f.unique:
+                    unique_checks.append((model_class, (name,)))
+                if f.unique_for_date:
+                    date_checks.append((model_class, 'date', name, f.unique_for_date))
+                if f.unique_for_year:
+                    date_checks.append((model_class, 'year', name, f.unique_for_year))
+                if f.unique_for_month:
+                    date_checks.append((model_class, 'month', name, f.unique_for_month))
+        return unique_checks, date_checks
+
+    def _perform_unique_checks(self, unique_checks):
+        errors = {}
+
+        for model_class, unique_check in unique_checks:
+            # Try to look up an existing object with the same values as this
+            # object's values for all the unique field.
+
+            lookup_kwargs = {}
+            for field_name in unique_check:
+                f = self._meta.get_field(field_name)
+                lookup_value = getattr(self, f.attname)
+                if lookup_value is None:
+                    # no value, skip the lookup
+                    continue
+                if f.primary_key and not getattr(self, '_adding', False):
+                    # no need to check for unique primary key when editing
+                    continue
+                lookup_kwargs[str(field_name)] = lookup_value
+
+            # some fields were skipped, no reason to do the check
+            if len(unique_check) != len(lookup_kwargs.keys()):
+                continue
+
+            qs = model_class._default_manager.filter(**lookup_kwargs)
+
+            # Exclude the current object from the query if we are editing an
+            # instance (as opposed to creating a new one)
+            if not getattr(self, '_adding', False) and self.pk is not None:
+                qs = qs.exclude(pk=self.pk)
+
+            if qs.exists():
+                if len(unique_check) == 1:
+                    key = unique_check[0]
+                else:
+                    key = NON_FIELD_ERRORS
+                errors.setdefault(key, []).append(self.unique_error_message(model_class, unique_check))
+
+        return errors
+
+    def _perform_date_checks(self, date_checks):
+        errors = {}
+        for model_class, lookup_type, field, unique_for in date_checks:
+            lookup_kwargs = {}
+            # there's a ticket to add a date lookup, we can remove this special
+            # case if that makes it's way in
+            date = getattr(self, unique_for)
+            if lookup_type == 'date':
+                lookup_kwargs['%s__day' % unique_for] = date.day
+                lookup_kwargs['%s__month' % unique_for] = date.month
+                lookup_kwargs['%s__year' % unique_for] = date.year
             else:
-                filename = filename[:dot_index] + '_' + filename[dot_index:]
+                lookup_kwargs['%s__%s' % (unique_for, lookup_type)] = getattr(date, lookup_type)
+            lookup_kwargs[field] = getattr(self, field)
 
-        # Write the file to disk.
-        setattr(self, field.attname, filename)
+            qs = model_class._default_manager.filter(**lookup_kwargs)
+            # Exclude the current object from the query if we are editing an
+            # instance (as opposed to creating a new one)
+            if not getattr(self, '_adding', False) and self.pk is not None:
+                qs = qs.exclude(pk=self.pk)
 
-        full_filename = self._get_FIELD_filename(field)
-        fp = open(full_filename, 'wb')
-        fp.write(raw_contents)
-        fp.close()
+            if qs.exists():
+                errors.setdefault(field, []).append(
+                    self.date_error_message(lookup_type, field, unique_for)
+                )
+        return errors
 
-        # Save the width and/or height, if applicable.
-        if isinstance(field, ImageField) and (field.width_field or field.height_field):
-            from django.utils.images import get_image_dimensions
-            width, height = get_image_dimensions(full_filename)
-            if field.width_field:
-                setattr(self, field.width_field, width)
-            if field.height_field:
-                setattr(self, field.height_field, height)
+    def date_error_message(self, lookup_type, field, unique_for):
+        opts = self._meta
+        return _(u"%(field_name)s must be unique for %(date_field)s %(lookup)s.") % {
+            'field_name': unicode(capfirst(opts.get_field(field).verbose_name)),
+            'date_field': unicode(capfirst(opts.get_field(unique_for).verbose_name)),
+            'lookup': lookup_type,
+        }
 
-        # Save the object, because it has changed.
-        self.save()
+    def unique_error_message(self, model_class, unique_check):
+        opts = model_class._meta
+        model_name = capfirst(opts.verbose_name)
 
-    _save_FIELD_file.alters_data = True
+        # A unique field
+        if len(unique_check) == 1:
+            field_name = unique_check[0]
+            field_label = capfirst(opts.get_field(field_name).verbose_name)
+            # Insert the error into the error dict, very sneaky
+            return _(u"%(model_name)s with this %(field_label)s already exists.") %  {
+                'model_name': unicode(model_name),
+                'field_label': unicode(field_label)
+            }
+        # unique_together
+        else:
+            field_labels = map(lambda f: capfirst(opts.get_field(f).verbose_name), unique_check)
+            field_labels = get_text_list(field_labels, _('and'))
+            return _(u"%(model_name)s with this %(field_label)s already exists.") %  {
+                'model_name': unicode(model_name),
+                'field_label': unicode(field_labels)
+            }
 
-    def _get_FIELD_width(self, field):
-        return self._get_image_dimensions(field)[0]
+    def full_clean(self, exclude=None):
+        """
+        Calls clean_fields, clean, and validate_unique, on the model,
+        and raises a ``ValidationError`` for any errors that occured.
+        """
+        errors = {}
+        if exclude is None:
+            exclude = []
 
-    def _get_FIELD_height(self, field):
-        return self._get_image_dimensions(field)[1]
+        try:
+            self.clean_fields(exclude=exclude)
+        except ValidationError, e:
+            errors = e.update_error_dict(errors)
 
-    def _get_image_dimensions(self, field):
-        cachename = "__%s_dimensions_cache" % field.name
-        if not hasattr(self, cachename):
-            from django.utils.images import get_image_dimensions
-            filename = self._get_FIELD_filename(field)
-            setattr(self, cachename, get_image_dimensions(filename))
-        return getattr(self, cachename)
+        # Form.clean() is run even if other validation fails, so do the
+        # same with Model.clean() for consistency.
+        try:
+            self.clean()
+        except ValidationError, e:
+            errors = e.update_error_dict(errors)
 
-    # Handles setting many-to-many related objects.
-    # Example: Album.set_songs()
-    def _set_related_many_to_many(self, rel_class, rel_field, id_list):
-        id_list = map(int, id_list) # normalize to integers
-        rel = rel_field.rel.to
-        m2m_table = rel_field.m2m_db_table()
-        this_id = self._get_pk_val()
-        cursor = connection.cursor()
-        cursor.execute("DELETE FROM %s WHERE %s = %%s" % \
-            (backend.quote_name(m2m_table),
-            backend.quote_name(rel_field.m2m_column_name())), [this_id])
-        sql = "INSERT INTO %s (%s, %s) VALUES (%%s, %%s)" % \
-            (backend.quote_name(m2m_table),
-            backend.quote_name(rel_field.m2m_column_name()),
-            backend.quote_name(rel_field.m2m_reverse_name()))
-        cursor.executemany(sql, [(this_id, i) for i in id_list])
-        transaction.commit_unless_managed()
+        # Run unique checks, but only for fields that passed validation.
+        for name in errors.keys():
+            if name != NON_FIELD_ERRORS and name not in exclude:
+                exclude.append(name)
+        try:
+            self.validate_unique(exclude=exclude)
+        except ValidationError, e:
+            errors = e.update_error_dict(errors)
+
+        if errors:
+            raise ValidationError(errors)
+
+    def clean_fields(self, exclude=None):
+        """
+        Cleans all fields and raises a ValidationError containing message_dict
+        of all validation errors if any occur.
+        """
+        if exclude is None:
+            exclude = []
+
+        errors = {}
+        for f in self._meta.fields:
+            if f.name in exclude:
+                continue
+            # Skip validation for empty fields with blank=True. The developer
+            # is responsible for making sure they have a valid value.
+            raw_value = getattr(self, f.attname)
+            if f.blank and raw_value in validators.EMPTY_VALUES:
+                continue
+            try:
+                setattr(self, f.attname, f.clean(raw_value, self))
+            except ValidationError, e:
+                errors[f.name] = e.messages
+
+        if errors:
+            raise ValidationError(errors)
+
 
 ############################################
 # HELPER FUNCTIONS (CURRIED MODEL METHODS) #
@@ -400,32 +913,62 @@ class Model(object):
 
 # ORDERING METHODS #########################
 
-def method_set_order(ordered_obj, self, id_list):
-    cursor = connection.cursor()
-    # Example: "UPDATE poll_choices SET _order = %s WHERE poll_id = %s AND id = %s"
-    sql = "UPDATE %s SET %s = %%s WHERE %s = %%s AND %s = %%s" % \
-        (backend.quote_name(ordered_obj._meta.db_table), backend.quote_name('_order'),
-        backend.quote_name(ordered_obj._meta.order_with_respect_to.column),
-        backend.quote_name(ordered_obj._meta.pk.column))
+def method_set_order(ordered_obj, self, id_list, using=None):
+    if using is None:
+        using = DEFAULT_DB_ALIAS
     rel_val = getattr(self, ordered_obj._meta.order_with_respect_to.rel.field_name)
-    cursor.executemany(sql, [(i, rel_val, j) for i, j in enumerate(id_list)])
-    transaction.commit_unless_managed()
+    order_name = ordered_obj._meta.order_with_respect_to.name
+    # FIXME: It would be nice if there was an "update many" version of update
+    # for situations like this.
+    for i, j in enumerate(id_list):
+        ordered_obj.objects.filter(**{'pk': j, order_name: rel_val}).update(_order=i)
+    transaction.commit_unless_managed(using=using)
+
 
 def method_get_order(ordered_obj, self):
-    cursor = connection.cursor()
-    # Example: "SELECT id FROM poll_choices WHERE poll_id = %s ORDER BY _order"
-    sql = "SELECT %s FROM %s WHERE %s = %%s ORDER BY %s" % \
-        (backend.quote_name(ordered_obj._meta.pk.column),
-        backend.quote_name(ordered_obj._meta.db_table),
-        backend.quote_name(ordered_obj._meta.order_with_respect_to.column),
-        backend.quote_name('_order'))
     rel_val = getattr(self, ordered_obj._meta.order_with_respect_to.rel.field_name)
-    cursor.execute(sql, [rel_val])
-    return [r[0] for r in cursor.fetchall()]
+    order_name = ordered_obj._meta.order_with_respect_to.name
+    pk_name = ordered_obj._meta.pk.name
+    return [r[pk_name] for r in
+            ordered_obj.objects.filter(**{order_name: rel_val}).values(pk_name)]
+
 
 ##############################################
 # HELPER FUNCTIONS (CURRIED MODEL FUNCTIONS) #
 ##############################################
 
-def get_absolute_url(opts, func, self):
-    return settings.ABSOLUTE_URL_OVERRIDES.get('%s.%s' % (opts.app_label, opts.module_name), func)(self)
+def get_absolute_url(opts, func, self, *args, **kwargs):
+    return settings.ABSOLUTE_URL_OVERRIDES.get('%s.%s' % (opts.app_label, opts.module_name), func)(self, *args, **kwargs)
+
+
+########
+# MISC #
+########
+
+class Empty(object):
+    pass
+
+def simple_class_factory(model, attrs):
+    """Used to unpickle Models without deferred fields.
+
+    We need to do this the hard way, rather than just using
+    the default __reduce__ implementation, because of a
+    __deepcopy__ problem in Python 2.4
+    """
+    return model
+
+def model_unpickle(model, attrs, factory):
+    """
+    Used to unpickle Model subclasses with deferred fields.
+    """
+    cls = factory(model, attrs)
+    return cls.__new__(cls)
+model_unpickle.__safe_for_unpickle__ = True
+
+if sys.version_info < (2, 5):
+    # Prior to Python 2.5, Exception was an old-style class
+    def subclass_exception(name, parents, unused):
+        return types.ClassType(name, parents, {})
+else:
+    def subclass_exception(name, parents, module):
+        return type(name, parents, {'__module__': module})

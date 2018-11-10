@@ -1,21 +1,37 @@
+import datetime
+from warnings import warn
 from django.core.exceptions import ImproperlyConfigured
+from django.utils.importlib import import_module
 
 SESSION_KEY = '_auth_user_id'
 BACKEND_SESSION_KEY = '_auth_user_backend'
-LOGIN_URL = '/accounts/login/'
 REDIRECT_FIELD_NAME = 'next'
 
 def load_backend(path):
     i = path.rfind('.')
     module, attr = path[:i], path[i+1:]
     try:
-        mod = __import__(module, '', '', [attr])
+        mod = import_module(module)
     except ImportError, e:
-        raise ImproperlyConfigured, 'Error importing authentication backend %s: "%s"' % (module, e)
+        raise ImproperlyConfigured('Error importing authentication backend %s: "%s"' % (module, e))
+    except ValueError, e:
+        raise ImproperlyConfigured('Error importing authentication backends. Is AUTHENTICATION_BACKENDS a correctly defined list or tuple?')
     try:
         cls = getattr(mod, attr)
     except AttributeError:
-        raise ImproperlyConfigured, 'Module "%s" does not define a "%s" authentication backend' % (module, attr)
+        raise ImproperlyConfigured('Module "%s" does not define a "%s" authentication backend' % (module, attr))
+    try:
+        getattr(cls, 'supports_object_permissions')
+    except AttributeError:
+        warn("Authentication backends without a `supports_object_permissions` attribute are deprecated. Please define it in %s." % cls,
+             PendingDeprecationWarning)
+        cls.supports_object_permissions = False
+    try:
+        getattr(cls, 'supports_anonymous_user')
+    except AttributeError:
+        warn("Authentication backends without a `supports_anonymous_user` attribute are deprecated. Please define it in %s." % cls,
+             PendingDeprecationWarning)
+        cls.supports_anonymous_user = False
     return cls()
 
 def get_backends():
@@ -49,21 +65,31 @@ def login(request, user):
     if user is None:
         user = request.user
     # TODO: It would be nice to support different login methods, like signed cookies.
+    user.last_login = datetime.datetime.now()
+    user.save()
+
+    if SESSION_KEY in request.session:
+        if request.session[SESSION_KEY] != user.id:
+            # To avoid reusing another user's session, create a new, empty
+            # session if the existing session corresponds to a different
+            # authenticated user.
+            request.session.flush()
+    else:
+        request.session.cycle_key()
     request.session[SESSION_KEY] = user.id
     request.session[BACKEND_SESSION_KEY] = user.backend
+    if hasattr(request, 'user'):
+        request.user = user
 
 def logout(request):
     """
-    Remove the authenticated user's ID from the request.
+    Removes the authenticated user's ID from the request and flushes their
+    session data.
     """
-    try:
-        del request.session[SESSION_KEY]
-    except KeyError:
-        pass
-    try:
-        del request.session[BACKEND_SESSION_KEY]
-    except KeyError:
-        pass
+    request.session.flush()
+    if hasattr(request, 'user'):
+        from django.contrib.auth.models import AnonymousUser
+        request.user = AnonymousUser()
 
 def get_user(request):
     from django.contrib.auth.models import AnonymousUser
